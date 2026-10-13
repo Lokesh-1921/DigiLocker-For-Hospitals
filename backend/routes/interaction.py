@@ -1,0 +1,570 @@
+from http import HTTPStatus
+
+from fastapi import APIRouter, Depends, BackgroundTasks
+from sqlalchemy.orm import Session
+
+from database import get_db
+from models import Interaction
+from schemas import (
+    APIResponse,
+    InteractionCreate,
+    InteractionResponse
+)
+
+from utils.logger import logger
+from websocket_manager import manager
+from services.redis_service import redis_service
+from services.session_memory import session_memory
+
+
+router = APIRouter(
+    prefix="/interaction",
+    tags=["Interaction"]
+)
+
+
+# ============================================================
+# Create Interaction
+# ============================================================
+
+@router.post(
+    "/",
+    operation_id="createInteraction",
+    status_code=HTTPStatus.CREATED,
+    response_model=APIResponse[InteractionResponse],
+    summary="Create Interaction",
+    description="Create and store a new HCP interaction.",
+    responses={
+        201: {
+            "description": "Interaction created successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "success": True,
+                        "message": "Interaction created successfully.",
+                        "data": {
+                            "interaction_id": 1,
+                            "hcp_name": "Dr Sharma",
+                            "summary": "Discussed CardioX efficacy study.",
+                            "product": "CardioX",
+                            "follow_up": "2026-08-15"
+                        },
+                        "error": None
+                    }
+                }
+            }
+        },
+        400: {
+            "description": "Invalid request"
+        },
+        500: {
+            "description": "Internal server error"
+        }
+    }
+)
+def create_interaction(
+    interaction: InteractionCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+
+    logger.info(
+        f"Creating interaction for HCP: {interaction.hcp_name} "
+        f"(Session: {interaction.session_id})"
+    )
+
+    try:
+
+        new_interaction = Interaction(
+
+            hcp_name=interaction.hcp_name,
+            specialization=interaction.specialization,
+            hospital=interaction.hospital,
+            interaction_date=interaction.interaction_date,
+            interaction_type=interaction.interaction_type,
+            summary=interaction.summary,
+            product=interaction.product,
+            outcome=interaction.outcome,
+            follow_up=interaction.follow_up,
+            notes=interaction.notes
+
+        )
+
+        db.add(new_interaction)
+
+        db.commit()
+
+        db.refresh(new_interaction)
+
+        logger.info(
+            f"Interaction created successfully. ID={new_interaction.id}"
+        )
+
+        # ============================================================
+        # Store interaction data in session memory
+        # ============================================================
+        if interaction.session_id:
+            try:
+                session_memory.set_value(
+                    interaction.session_id,
+                    "last_hcp",
+                    new_interaction.hcp_name
+                )
+
+                session_memory.set_value(
+                    interaction.session_id,
+                    "last_product",
+                    new_interaction.product
+                )
+
+                session_memory.set_value(
+                    interaction.session_id,
+                    "last_summary",
+                    new_interaction.summary
+                )
+
+                session_memory.set_value(
+                    interaction.session_id,
+                    "last_follow_up",
+                    new_interaction.follow_up.isoformat()
+                    if new_interaction.follow_up
+                    else None
+                )
+
+                session_memory.set_value(
+                    interaction.session_id,
+                    "last_interaction_id",
+                    new_interaction.id
+                )
+
+                logger.info(
+                    f"Stored interaction data in session memory "
+                    f"for session: {interaction.session_id}"
+                )
+            except Exception as session_error:
+                logger.error(
+                    f"Failed to store interaction in session memory: "
+                    f"{session_error}"
+                )
+
+        # Invalidate dashboard cache
+        try:
+            redis_service.delete_pattern("dashboard:*")
+            logger.info("Dashboard cache cleared after interaction creation.")
+        except Exception as cache_error:
+            logger.error(f"Failed to clear dashboard cache: {cache_error}")
+
+        # Broadcast dashboard update to all connected WebSocket clients
+        background_tasks.add_task(
+            manager.broadcast,
+            {
+                "event": "dashboard_updated",
+                "type": "interaction_created",
+                "interaction_id": new_interaction.id,
+                "message": "New interaction created"
+            }
+        )
+
+        return APIResponse[InteractionResponse](
+
+            success=True,
+
+            message="Interaction created successfully.",
+
+            data=new_interaction,
+
+            error=None
+
+        )
+
+    except Exception as e:
+
+        db.rollback()
+
+        logger.exception(
+            "Failed to create interaction."
+        )
+
+        return APIResponse[InteractionResponse](
+
+            success=False,
+
+            message="Failed to create interaction.",
+
+            data=None,
+
+            error=str(e)
+
+        )
+
+
+# ============================================================
+# Get All Interactions
+# ============================================================
+
+@router.get(
+    "/",
+    operation_id="getAllInteractions",
+    response_model=APIResponse[list[InteractionResponse]],
+    summary="Get All Interactions",
+    description="Retrieve all stored HCP interactions.",
+    responses={
+        200: {
+            "description": "Interactions retrieved successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "success": True,
+                        "message": "Interactions retrieved successfully.",
+                        "data": [
+                            {
+                                "interaction_id": 1,
+                                "hcp_name": "Dr Sharma",
+                                "summary": "Discussed CardioX efficacy study.",
+                                "product": "CardioX",
+                                "follow_up": "2026-08-15"
+                            }
+                        ],
+                        "error": None
+                    }
+                }
+            }
+        },
+        500: {
+            "description": "Internal server error"
+        }
+    }
+)
+def get_interactions(
+    db: Session = Depends(get_db)
+):
+
+    logger.info("Fetching all interactions.")
+
+    try:
+
+        interactions = (
+
+            db.query(Interaction)
+
+            .order_by(
+                Interaction.id.desc()
+            )
+
+            .all()
+
+        )
+
+        logger.info(
+            f"Retrieved {len(interactions)} interactions."
+        )
+
+        return APIResponse[list[InteractionResponse]](
+
+            success=True,
+
+            message="Interactions retrieved successfully.",
+
+            data=interactions,
+
+            error=None
+
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Failed to retrieve interactions."
+        )
+
+        return APIResponse[list[InteractionResponse]](
+
+            success=False,
+
+            message="Failed to retrieve interactions.",
+
+            data=[],
+
+            error=str(e)
+
+        )
+
+
+# ============================================================
+# Delete Interaction
+# ============================================================
+
+@router.delete(
+    "/{interaction_id}",
+    operation_id="deleteInteraction",
+    response_model=APIResponse[dict],
+    summary="Delete Interaction",
+    description="Delete an existing interaction by ID.",
+    responses={
+        200: {
+            "description": "Interaction deleted successfully"
+        },
+        404: {
+            "description": "Interaction not found"
+        },
+        500: {
+            "description": "Internal server error"
+        }
+    }
+)
+def delete_interaction(
+    interaction_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+
+    logger.info(f"Deleting interaction with ID: {interaction_id}")
+
+    try:
+
+        interaction = (
+
+            db.query(Interaction)
+
+            .filter(Interaction.id == interaction_id)
+
+            .first()
+
+        )
+
+        if not interaction:
+
+            logger.warning(f"Interaction {interaction_id} not found.")
+
+            return APIResponse[dict](
+
+                success=False,
+
+                message="Interaction not found.",
+
+                data=None,
+
+                error="Interaction does not exist"
+
+            )
+
+        db.delete(interaction)
+
+        db.commit()
+
+        logger.info(f"Interaction {interaction_id} deleted successfully.")
+
+        # Invalidate dashboard cache
+        try:
+            redis_service.delete_pattern("dashboard:*")
+            logger.info("Dashboard cache cleared after interaction deletion.")
+        except Exception as cache_error:
+            logger.error(f"Failed to clear dashboard cache: {cache_error}")
+
+        # Broadcast dashboard update to all connected WebSocket clients
+        background_tasks.add_task(
+            manager.broadcast,
+            {
+                "event": "dashboard_updated",
+                "type": "interaction_deleted",
+                "interaction_id": interaction_id,
+                "message": "Interaction deleted"
+            }
+        )
+
+        return APIResponse[dict](
+
+            success=True,
+
+            message="Interaction deleted successfully.",
+
+            data={"deleted_id": interaction_id},
+
+            error=None
+
+        )
+
+    except Exception as e:
+
+        db.rollback()
+
+        logger.exception(f"Failed to delete interaction {interaction_id}.")
+
+        return APIResponse[dict](
+
+            success=False,
+
+            message="Failed to delete interaction.",
+
+            data=None,
+
+            error=str(e)
+
+        )
+
+
+# ============================================================
+# Update Interaction
+# ============================================================
+
+@router.put(
+    "/{interaction_id}",
+    operation_id="updateInteraction",
+    response_model=APIResponse[InteractionResponse],
+    summary="Update Interaction",
+    description="Update an existing interaction by ID.",
+    responses={
+        200: {
+            "description": "Interaction updated successfully"
+        },
+        404: {
+            "description": "Interaction not found"
+        },
+        500: {
+            "description": "Internal server error"
+        }
+    }
+)
+def update_interaction(
+    interaction_id: int,
+    interaction_data: InteractionCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+
+    logger.info(f"Updating interaction with ID: {interaction_id}")
+
+    try:
+
+        interaction = (
+
+            db.query(Interaction)
+
+            .filter(Interaction.id == interaction_id)
+
+            .first()
+
+        )
+
+        if not interaction:
+
+            logger.warning(f"Interaction {interaction_id} not found.")
+
+            return APIResponse[InteractionResponse](
+
+                success=False,
+
+                message="Interaction not found.",
+
+                data=None,
+
+                error="Interaction does not exist"
+
+            )
+
+        # Update fields
+        interaction.hcp_name = interaction_data.hcp_name
+        interaction.summary = interaction_data.summary
+        interaction.product = interaction_data.product
+        interaction.follow_up = interaction_data.follow_up
+
+        db.commit()
+
+        db.refresh(interaction)
+
+        logger.info(f"Interaction {interaction_id} updated successfully.")
+
+        # ============================================================
+        # Store updated interaction data in session memory
+        # ============================================================
+        if interaction_data.session_id:
+            try:
+                session_memory.set_value(
+                    interaction_data.session_id,
+                    "last_hcp",
+                    interaction.hcp_name
+                )
+
+                session_memory.set_value(
+                    interaction_data.session_id,
+                    "last_product",
+                    interaction.product
+                )
+
+                session_memory.set_value(
+                    interaction_data.session_id,
+                    "last_summary",
+                    interaction.summary
+                )
+
+                session_memory.set_value(
+                    interaction_data.session_id,
+                    "last_follow_up",
+                    interaction.follow_up.isoformat()
+                    if interaction.follow_up
+                    else None
+                )
+
+                session_memory.set_value(
+                    interaction_data.session_id,
+                    "last_interaction_id",
+                    interaction.id
+                )
+
+                logger.info(
+                    f"Updated interaction data in session memory "
+                    f"for session: {interaction_data.session_id}"
+                )
+            except Exception as session_error:
+                logger.error(
+                    f"Failed to update interaction in session memory: "
+                    f"{session_error}"
+                )
+
+        # Invalidate dashboard cache
+        try:
+            redis_service.delete_pattern("dashboard:*")
+            logger.info("Dashboard cache cleared after interaction update.")
+        except Exception as cache_error:
+            logger.error(f"Failed to clear dashboard cache: {cache_error}")
+
+        # Broadcast dashboard update to all connected WebSocket clients
+        background_tasks.add_task(
+            manager.broadcast,
+            {
+                "event": "dashboard_updated",
+                "type": "interaction_updated",
+                "interaction_id": interaction_id,
+                "message": "Interaction updated"
+            }
+        )
+
+        return APIResponse[InteractionResponse](
+
+            success=True,
+
+            message="Interaction updated successfully.",
+
+            data=interaction,
+
+            error=None
+
+        )
+
+    except Exception as e:
+
+        db.rollback()
+
+        logger.exception(f"Failed to update interaction {interaction_id}.")
+
+        return APIResponse[InteractionResponse](
+
+            success=False,
+
+            message="Failed to update interaction.",
+
+            data=None,
+
+            error=str(e)
+
+        )
